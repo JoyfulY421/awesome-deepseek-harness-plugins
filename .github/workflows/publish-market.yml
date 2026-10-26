@@ -103,10 +103,20 @@ jobs:
             --concurrency 8 \
             --timeout-ms 60000
 
+      - name: 已发布到 npm 的插件改写为 npm 直装来源（避免国内 git clone GitHub 失败）
+        continue-on-error: true
+        env:
+          NPM_CONCURRENCY: '8'
+          NPM_TIMEOUT_MS: '30000'
+        run: |
+          node market-tools/npm-resolve.mjs market/index.json
+
       - name: 校验索引已生成
         run: |
           test -s market/index.json
           node -e "const i=require('./market/index.json'); console.log('format:', i.format, 'plugins:', i.plugins.length); if(i.format!==1||!i.plugins.length) process.exit(1)"
+          echo '--- 来源类型统计（npm=直装稳定，git=克隆仓库） ---'
+          node -e "const i=require('./market/index.json'); const c={}; for(const p of i.plugins){const t=p.versions[0].source.type; c[t]=(c[t]||0)+1;} console.log(c)"
           echo '--- 站点目录内容 ---'
           ls -la market
           if [ -d market/icons ]; then echo "icons: $(ls market/icons | wc -l) 个"; fi
