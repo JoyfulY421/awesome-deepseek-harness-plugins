@@ -48,9 +48,11 @@ const CACHE_PATH =
   process.env.REPO_META_CACHE ||
   join('market-tools', '.plugin-market-cache', 'repo-meta.json');
 const CONCURRENCY = Number(process.env.ENRICH_CONCURRENCY || 8) || 8;
+const DL_CONCURRENCY = Number(process.env.NPM_DL_CONCURRENCY || 2) || 2; // npm 下载量接口低并发，避免 429
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
 const SKIP_GITHUB = process.env.SKIP_GITHUB === '1';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 每天刷新一次
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // GitHub 仓库元信息每天刷新
+const DL_TTL_MS = 7 * 24 * 60 * 60 * 1000;    // npm 下载量仅用于排序，7 天刷新一次即可
 const GITHUB = 'https://api.github.com';
 const NPM_DL = 'https://api.npmjs.org/downloads/point/last-month';
 
@@ -64,7 +66,7 @@ function readJsonNoBom(path) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unixNow = () => Math.floor(Date.now() / 1000);
 
-async function fetchJson(url, { headers = {}, timeoutMs = 30000, retries = 3 } = {}) {
+async function fetchJson(url, { headers = {}, timeoutMs = 30000, retries = 3, maxRateLimitWaitMs = 60000 } = {}) {
   let lastErr;
   for (let attempt = 0; attempt < retries; attempt++) {
     const ctrl = new AbortController();
@@ -77,9 +79,9 @@ async function fetchJson(url, { headers = {}, timeoutMs = 30000, retries = 3 } =
       clearTimeout(timer);
       if (res.status === 404) return { __notFound: true };
       if (res.status === 403 || res.status === 429) {
-        // 限流：读 reset 时间，最多等 60s 后重试
+        // 限流：读 reset 时间，最多等 maxRateLimitWaitMs 后重试
         const wait = Math.min(
-          60000,
+          maxRateLimitWaitMs,
           Math.max(2000, Number(res.headers.get('retry-after') || 0) * 1000 ||
             attempt * 8000 + 4000),
         );
@@ -402,9 +404,15 @@ async function fetchRepoMeta(root, cache) {
 async function fetchNpmDownloads(name, cache) {
   const key = `npm:${name}`;
   const cached = cache.npm[key];
-  if (cached && cached.fetchedAt && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.downloads;
+  // 下载量仅用于排序，缓存窗口拉长到 7 天，避免每天都对全量包发请求触发 429
+  if (cached && cached.fetchedAt && Date.now() - cached.fetchedAt < DL_TTL_MS) return cached.downloads;
   try {
-    const data = await fetchJson(`${NPM_DL}/${encodeURIComponent(name)}`);
+    // 低重试、短等待：失败就先记 0（不写缓存），后续每日任务再补
+    const data = await fetchJson(`${NPM_DL}/${encodeURIComponent(name)}`, {
+      retries: 2,
+      timeoutMs: 15000,
+      maxRateLimitWaitMs: 8000,
+    });
     const downloads = Number(data.downloads || 0);
     cache.npm[key] = { downloads, fetchedAt: Date.now() };
     return downloads;
@@ -446,8 +454,11 @@ async function main() {
   });
   saveCache(cache);
 
-  // 2) npm 下载量
-  await mapPool(npmNames, CONCURRENCY, async (name) => {
+  // 2) npm 下载量（低并发 + 轻微节流，避免 downloads 接口 429）
+  let dlIdx = 0;
+  await mapPool(npmNames, DL_CONCURRENCY, async (name) => {
+    const my = dlIdx++;
+    await sleep(my * 120); // 错峰启动，避免第一时间并发打爆接口
     await fetchNpmDownloads(name, cache);
   });
   saveCache(cache);
