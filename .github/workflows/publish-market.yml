@@ -116,7 +116,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_META_CACHE: ${{ github.workspace }}/market-tools/.plugin-market-cache/repo-meta.json
-          ENRICH_CONCURRENCY: '8'
+          ENRICH_CONCURRENCY: '8'        # GitHub 仓库元信息（star/活跃）并发，令牌额度内
+          NPM_DL_CONCURRENCY: '2'        # npm 下载量接口低并发，避免 429
+          NPM_DL_FETCH_CAP: '120'       # 每次运行最多更新的 npm 包数（7 天轮转 + 冷启动分天摊开）
         run: |
           node market-tools/enrich-meta.mjs market/index.json catalog
 

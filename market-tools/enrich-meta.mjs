@@ -49,10 +49,11 @@ const CACHE_PATH =
   join('market-tools', '.plugin-market-cache', 'repo-meta.json');
 const CONCURRENCY = Number(process.env.ENRICH_CONCURRENCY || 8) || 8;
 const DL_CONCURRENCY = Number(process.env.NPM_DL_CONCURRENCY || 2) || 2; // npm 下载量接口低并发，避免 429
+const DL_FETCH_CAP = Number(process.env.NPM_DL_FETCH_CAP || 120) || 120; // 单次运行最多更新多少个包（首次冷启动分天摊开）
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
 const SKIP_GITHUB = process.env.SKIP_GITHUB === '1';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;     // GitHub 仓库元信息每天刷新
-const DL_TTL_MS = 7 * 24 * 60 * 60 * 1000;    // npm 下载量仅用于排序，7 天刷新一次即可
+const DL_TTL_MS = 7 * 24 * 60 * 60 * 1000;    // npm 下载量仅用于排序，7 天内视为新鲜
 const GITHUB = 'https://api.github.com';
 const NPM_DL = 'https://api.npmjs.org/downloads/point/last-month';
 
@@ -65,6 +66,30 @@ function readJsonNoBom(path) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unixNow = () => Math.floor(Date.now() / 1000);
+
+// 稳定字符串哈希（FNV-1a），用于把下载量更新稳定地分摊到不同日期，不依赖运行顺序
+function hashStr(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+// npm 下载量接口的全局“节流阀”：一旦遇到 429/5xx，所有后续请求都在此基础上额外冷却
+const dlThrottle = { pauseUntil: 0, hits: 0 };
+async function dlGate() {
+  const wait = dlThrottle.pauseUntil - Date.now();
+  if (wait > 0) await sleep(wait);
+}
+function dlBackoff(status) {
+  dlThrottle.hits++;
+  // 第 1 次限流冷却 2.5s，之后每次 +1.5s，上限 12s（整体减速，而不是长时间死等）
+  const ms = Math.min(12000, 2500 + (dlThrottle.hits - 1) * 1500);
+  dlThrottle.pauseUntil = Math.max(dlThrottle.pauseUntil, Date.now() + ms);
+  return status;
+}
 
 async function fetchJson(url, { headers = {}, timeoutMs = 30000, retries = 3, maxRateLimitWaitMs = 60000 } = {}) {
   let lastErr;
@@ -395,32 +420,94 @@ async function fetchRepoMeta(root, cache) {
       fetchedAt: Date.now(),
     });
   } catch (err) {
-    // 失败不写缓存，下次运行再试；本次返回空值
+    // 失败不写缓存，下次运行再试；本次若有旧值则沿用，否则返回空值
+    if (cached) {
+      console.warn(`  GitHub 仓库信息获取失败，沿用旧值 ${root}: ${err.message}`);
+      return cached;
+    }
     console.warn(`  GitHub 仓库信息获取失败 ${root}: ${err.message}`);
     return { stars: 0, updatedAt: null, missing: false };
   }
 }
 
+// 取单个包的下载量：失败（含 429）不长时间死等，直接返回“旧值或 0”，且不覆盖缓存；
+// 下一次运行（或该包轮转日）再尝试。下载量只用于排序，短期用旧值不会有明显差异。
 async function fetchNpmDownloads(name, cache) {
   const key = `npm:${name}`;
-  const cached = cache.npm[key];
-  // 下载量仅用于排序，缓存窗口拉长到 7 天，避免每天都对全量包发请求触发 429
-  if (cached && cached.fetchedAt && Date.now() - cached.fetchedAt < DL_TTL_MS) return cached.downloads;
-  try {
-    // 低重试、短等待：失败就先记 0（不写缓存），后续每日任务再补
-    const data = await fetchJson(`${NPM_DL}/${encodeURIComponent(name)}`, {
-      retries: 2,
-      timeoutMs: 15000,
-      maxRateLimitWaitMs: 8000,
-    });
-    const downloads = Number(data.downloads || 0);
-    cache.npm[key] = { downloads, fetchedAt: Date.now() };
-    return downloads;
-  } catch (err) {
-    console.warn(`  npm 下载量获取失败 ${name}: ${err.message}`);
-    return 0;
+  const stale = cache.npm[key]; // 可能是已过期的旧值
+  const url = `${NPM_DL}/${encodeURIComponent(name)}`;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await dlGate();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'dsh-market-enrich' },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (res.status === 429 || res.status === 403 || res.status === 503 || res.status === 502) {
+        dlBackoff(res.status);
+        continue; // 受全局节流后再试一次，仍失败就放弃
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const downloads = Number(data.downloads || 0);
+      cache.npm[key] = { downloads, fetchedAt: Date.now() };
+      return downloads;
+    } catch (err) {
+      // 网络错误等也触发轻微减速，再试一次
+      if (err?.name === 'AbortError') dlBackoff('timeout');
+      await sleep(1000 * (attempt + 1));
+    }
   }
+  // 两次都失败：沿用旧值，没有旧值就记 0；不写缓存，便于下次补取
+  if (stale && Number.isFinite(stale.downloads)) {
+    console.warn(`  npm 下载量获取失败，沿用 ${Math.round((Date.now() - stale.fetchedAt) / 86400000)} 天前旧值: ${name}`);
+    return stale.downloads;
+  }
+  console.warn(`  npm 下载量获取失败，本次记 0（下次补）: ${name}`);
+  return 0;
 }
+
+// 决定本次运行需要更新哪些包的下载量：
+//   - 7 天内有新值：跳过，直接用缓存
+//   - 无任何缓存（新包）：优先更新，但受 DL_FETCH_CAP 上限保护，冷启动分天摊开
+//   - 有旧值但已过期：按包名哈希轮转，只在“属于今天”的那批更新（约 1/7），其余沿用旧值
+function planNpmDownloads(names, cache) {
+  const now = Date.now();
+  const todaySlot = new Date().getUTCDay(); // 0..6（CI 用 UTC 时间，稳定）
+  const fresh = [];      // 7 天内有值，直接用
+  const missing = [];    // 完全没缓存
+  const staleDue = [];   // 有旧值、已过期，且按哈希轮到今天更新
+  const staleHold = [];  // 有旧值、已过期，但今天轮不到 -> 沿用旧值
+  for (const name of names) {
+    const e = cache.npm[`npm:${name}`];
+    if (!e) {
+      missing.push(name);
+    } else if (e.fetchedAt && now - e.fetchedAt < DL_TTL_MS) {
+      fresh.push(name);
+    } else if (hashStr(name) % 7 === todaySlot) {
+      staleDue.push(name);
+    } else {
+      staleHold.push(name);
+    }
+  }
+  const order = (a, b) => hashStr(a) - hashStr(b);
+  missing.sort(order);
+  staleDue.sort(order);
+  const pickMissing = missing.slice(0, DL_FETCH_CAP);
+  const pickStale = staleDue.slice(0, Math.max(0, DL_FETCH_CAP - pickMissing.length));
+  const fetchList = [...pickMissing, ...pickStale];
+  return {
+    fetchList,
+    freshCount: fresh.length,
+    useStaleCount: staleHold.length + (staleDue.length - pickStale.length),
+    deferredMissing: missing.length - pickMissing.length,
+  };
+}
+
 
 // ---------------------------------------------------------------------------
 // 主流程
@@ -442,11 +529,13 @@ async function main() {
   // 收集所有需要查询的根仓库 / npm 包
   const repoOfPlugin = plugins.map((p) => ({ p, repo: pluginRepo(p) }));
   const roots = [...new Set(repoOfPlugin.map((x) => x.repo?.root).filter(Boolean))];
-  const npmNames = plugins
-    .filter((p) => p.versions?.[0]?.source?.type === 'npm')
-    .map((p) => p.name);
+  const npmNames = [...new Set(
+    plugins
+      .filter((p) => p.versions?.[0]?.source?.type === 'npm')
+      .map((p) => p.name),
+  )];
 
-  console.log(`插件 ${plugins.length}，需查 GitHub 仓库 ${roots.length}，npm 下载 ${npmNames.length}`);
+  console.log(`插件 ${plugins.length}，需查 GitHub 仓库 ${roots.length}，npm 包 ${npmNames.length}`);
 
   // 1) GitHub 仓库元数据（stars / 活跃时间）
   await mapPool(roots, CONCURRENCY, async (root) => {
@@ -454,15 +543,20 @@ async function main() {
   });
   saveCache(cache);
 
-  // 2) npm 下载量（低并发 + 首批轻微错峰，避免 downloads 接口 429）
-  let dlIdx = 0;
-  await mapPool(npmNames, DL_CONCURRENCY, async (name) => {
-    const my = dlIdx++;
-    // 只错开最初的几个请求，避免并发数内同时打接口；后续任务不再延迟
-    if (my < DL_CONCURRENCY) await sleep(my * 150);
+  // 2) npm 下载量：限流友好——7 天缓存 + 分天轮转 + 单次上限 + 失败用旧值/0
+  const plan = planNpmDownloads(npmNames, cache);
+  console.log(
+    `npm 下载量：本次更新 ${plan.fetchList.length} 个，7 天内缓存 ${plan.freshCount} 个，` +
+    `沿用旧值 ${plan.useStaleCount} 个` +
+    (plan.deferredMissing > 0 ? `，超额延后 ${plan.deferredMissing} 个（分天补）` : ''),
+  );
+  await mapPool(plan.fetchList, DL_CONCURRENCY, async (name) => {
     await fetchNpmDownloads(name, cache);
   });
   saveCache(cache);
+  if (dlThrottle.hits > 0) {
+    console.warn(`  本次 npm 下载量接口共触发 ${dlThrottle.hits} 次限流减速（已按旧值/0 处理，不影响构建）`);
+  }
 
   // 3) 逐插件写入 metadata，并统计用到的标签
   const usedLabels = new Set();
