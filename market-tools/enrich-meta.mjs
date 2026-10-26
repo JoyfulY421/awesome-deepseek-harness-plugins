@@ -78,7 +78,8 @@ function hashStr(str) {
 }
 
 // npm 下载量接口的全局“节流阀”：一旦遇到 429/5xx，所有后续请求都在此基础上额外冷却
-const dlThrottle = { pauseUntil: 0, hits: 0 };
+const DL_FAIL_CIRCUIT = Number(process.env.NPM_DL_CIRCUIT || 6); // 连续失败这么多次就熔断，本次不再请求
+const dlThrottle = { pauseUntil: 0, hits: 0, failStreak: 0, circuitOpen: false, aborted: 0 };
 async function dlGate() {
   const wait = dlThrottle.pauseUntil - Date.now();
   if (wait > 0) await sleep(wait);
@@ -437,6 +438,12 @@ async function fetchNpmDownloads(name, cache) {
   const stale = cache.npm[key]; // 可能是已过期的旧值
   const url = `${NPM_DL}/${encodeURIComponent(name)}`;
 
+  // 熔断后：不再请求，直接用旧值/0
+  if (dlThrottle.circuitOpen) {
+    dlThrottle.aborted++;
+    return stale && Number.isFinite(stale.downloads) ? stale.downloads : 0;
+  }
+
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await dlGate();
@@ -455,6 +462,7 @@ async function fetchNpmDownloads(name, cache) {
       const data = await res.json();
       const downloads = Number(data.downloads || 0);
       cache.npm[key] = { downloads, fetchedAt: Date.now() };
+      dlThrottle.failStreak = 0; // 成功，重置连续失败计数
       return downloads;
     } catch (err) {
       // 网络错误等也触发轻微减速，再试一次
@@ -462,7 +470,10 @@ async function fetchNpmDownloads(name, cache) {
       await sleep(1000 * (attempt + 1));
     }
   }
-  // 两次都失败：沿用旧值，没有旧值就记 0；不写缓存，便于下次补取
+  // 两次都失败：连续失败累计，达到阈值则熔断本次剩余下载请求
+  dlThrottle.failStreak++;
+  if (dlThrottle.failStreak >= DL_FAIL_CIRCUIT) dlThrottle.circuitOpen = true;
+  // 沿用旧值，没有旧值就记 0；不写缓存，便于下次补取
   if (stale && Number.isFinite(stale.downloads)) {
     console.warn(`  npm 下载量获取失败，沿用 ${Math.round((Date.now() - stale.fetchedAt) / 86400000)} 天前旧值: ${name}`);
     return stale.downloads;
@@ -554,7 +565,9 @@ async function main() {
     await fetchNpmDownloads(name, cache);
   });
   saveCache(cache);
-  if (dlThrottle.hits > 0) {
+  if (dlThrottle.circuitOpen) {
+    console.warn(`  npm 下载量接口连续限流，已熔断：剩余 ${dlThrottle.aborted} 个本次跳过（旧值/0），次日再补`);
+  } else if (dlThrottle.hits > 0) {
     console.warn(`  本次 npm 下载量接口共触发 ${dlThrottle.hits} 次限流减速（已按旧值/0 处理，不影响构建）`);
   }
 
