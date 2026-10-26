@@ -1,0 +1,128 @@
+name: build-and-publish-plugin-market
+
+# 每天定时构建；也可在 Actions 页面手动运行（Run workflow）；脚本或工作流变更推送到 main 时也会运行。
+on:
+  schedule:
+    - cron: '0 2 * * *'          # UTC 02:00，即北京时间 10:00
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/publish-market.yml'
+      - 'market-tools/**'
+
+# 部署 GitHub Pages 需要这些权限。
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只允许一个发布任务，避免并发部署互相覆盖。
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MARKET_TITLE: '1024Store 插件镜像'
+  MARKET_DESC: '基于 awesome-deepseek-harness-plugins 目录自动生成的 DeepSeek Harness 插件索引（非官方）'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出自己的仓库（含 market-tools 脚本与工作流）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 配置 GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: 同步上游 1024Store 目录（只更新 catalog 子树，不合并、不改动你的其它文件）
+        run: |
+          git remote add upstream https://github.com/imsai-sh/awesome-deepseek-harness-plugins.git || true
+          git fetch --no-tags --depth 1 upstream main
+          git checkout upstream/main -- catalog
+          echo "catalog 条目数: $(ls catalog/plugins | wc -l)"
+
+      - name: 安装 Node.js 24（DSH 要求 >=24.9）
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装 pnpm（版本与 DSH 仓库 packageManager 字段保持一致）
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          run_install: false
+
+      - name: 浅克隆 DSH 主仓库（生成器所在位置，未发布到 npm）
+        run: |
+          git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git "$RUNNER_TEMP/dsh"
+
+      - name: 缓存 pnpm 全局 store
+        id: pnpm-cache
+        run: |
+          echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.dir }}
+          key: pnpm-store-${{ github.run_id }}
+          restore-keys: |
+            pnpm-store-
+
+      - name: 安装生成器及其依赖（仅该 workspace 包，避免构建其它原生组件）
+        working-directory: ${{ runner.temp }}/dsh
+        run: |
+          pnpm install --no-frozen-lockfile --filter @deepseek-ai/dsh-plugin-market-generator...
+
+      - name: 缓存生成器的 Git 抓取结果（增量更新的关键；去重后约 830 个仓库）
+        uses: actions/cache@v4
+        with:
+          path: market-tools/.plugin-market-cache
+          key: dsh-git-cache-${{ github.run_id }}
+          restore-keys: |
+            dsh-git-cache-
+
+      - name: 从 catalog 生成插件源列表（market-tools/plugins.txt）
+        run: |
+          node market-tools/build-plugin-list.mjs
+
+      - name: 运行官方生成器生成索引（部分源失败时退出码 1，但索引仍会写出）
+        id: gen
+        working-directory: ${{ runner.temp }}/dsh
+        continue-on-error: true
+        run: |
+          pnpm --filter @deepseek-ai/dsh-plugin-market-generator start \
+            --input "$GITHUB_WORKSPACE/market-tools/plugins.txt" \
+            --output "$GITHUB_WORKSPACE/market/index.json" \
+            --title "$MARKET_TITLE" \
+            --description "$MARKET_DESC" \
+            --concurrency 8 \
+            --timeout-ms 60000
+
+      - name: 校验索引已生成
+        run: |
+          test -s market/index.json
+          node -e "const i=require('./market/index.json'); console.log('format:', i.format, 'plugins:', i.plugins.length); if(i.format!==1||!i.plugins.length) process.exit(1)"
+          echo '--- 站点目录内容 ---'
+          ls -la market
+          if [ -d market/icons ]; then echo "icons: $(ls market/icons | wc -l) 个"; fi
+
+      - name: 打包站点目录（仅 market/，不含缓存与列表）
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: market
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

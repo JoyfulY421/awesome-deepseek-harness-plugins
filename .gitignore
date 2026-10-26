@@ -12,3 +12,9 @@ node_modules/
 /apps/web/.wrangler
 apps/web/tsconfig.app.tsbuildinfo
 apps/web/tsconfig.worker.tsbuildinfo
+# === 自建插件市场：生成产物与缓存（无需提交，由 GitHub Actions 重建） ===
+# 最终站点目录（index.json 与 icons/ 由 Actions 生成并直接发布到 Pages）
+/market/
+# 生成器输入列表与 Git 抓取缓存
+/market-tools/plugins.txt
+/market-tools/.plugin-market-cache/
