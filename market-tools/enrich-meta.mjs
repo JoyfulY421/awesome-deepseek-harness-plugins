@@ -454,11 +454,12 @@ async function main() {
   });
   saveCache(cache);
 
-  // 2) npm 下载量（低并发 + 轻微节流，避免 downloads 接口 429）
+  // 2) npm 下载量（低并发 + 首批轻微错峰，避免 downloads 接口 429）
   let dlIdx = 0;
   await mapPool(npmNames, DL_CONCURRENCY, async (name) => {
     const my = dlIdx++;
-    await sleep(my * 120); // 错峰启动，避免第一时间并发打爆接口
+    // 只错开最初的几个请求，避免并发数内同时打接口；后续任务不再延迟
+    if (my < DL_CONCURRENCY) await sleep(my * 150);
     await fetchNpmDownloads(name, cache);
   });
   saveCache(cache);
